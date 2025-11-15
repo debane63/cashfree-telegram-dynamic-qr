@@ -1,69 +1,74 @@
-const { createOrder } = require('../lib/cashfree');
-const { sendMessage } = require('../lib/telegram');
-const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
+const axios = require("axios");
+const QRCode = require("qrcode");
+const fs = require("fs");
+const path = require("path");
+const { createOrderLive } = require("../lib/cashfree");
 
 module.exports = async (req, res) => {
   try {
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-
-    const { user_id, amount, customer_phone } = req.body || {};
-    if (!user_id || !amount) return res.status(400).json({ error: 'user_id and amount required' });
-
-    const orderId = `order_${Date.now()}_${Math.floor(Math.random()*10000)}`;
-    const appId = process.env.CASHFREE_APP_ID;
-    const secret = process.env.CASHFREE_SECRET;
-    const baseUrl = process.env.BASE_URL;
-
-    if (!appId || !secret || !baseUrl) {
-      return res.status(500).json({ error: 'Missing env vars (CASHFREE_APP_ID / CASHFREE_SECRET / BASE_URL)' });
+    if (req.method !== "POST") {
+      return res.status(405).send("Method Not Allowed");
     }
 
-    const cfResp = await createOrder({
+    const { user_id, amount } = req.body;
+
+    if (!user_id || !amount) {
+      return res.status(400).json({ error: "user_id & amount required" });
+    }
+
+    const appId = process.env.CASHFREE_APP_ID;
+    const secret = process.env.CASHFREE_SECRET;
+
+    const orderId = `order_${Date.now()}`;
+
+    // Call Cashfree new API
+    const cfData = await createOrderLive({
       appId,
       secret,
       orderId,
       amount,
-      customerId: String(user_id),
-      customerPhone: customer_phone,
-      returnUrl: `${baseUrl}/thankyou`
+      userId: user_id
     });
 
-    // 인기 possible fields: payment_link, payment_link_ref, payment_url
-    const paymentLink =
-      cfResp.payment_link ||
-      cfResp.payment_url ||
-      (cfResp.data && (cfResp.data.payment_link || cfResp.data.payment_url)) ||
-      (cfResp?.data?.payment_link);
-
-    if (!paymentLink) {
-      // Some Cashfree responses embed link differently; return raw to debug
-      return res.status(500).json({ error: 'No payment link from Cashfree', raw: cfResp });
+    if (!cfData?.payment_session_id) {
+      return res.status(500).json({
+        error: "Cashfree did not return payment_session_id",
+        raw: cfData
+      });
     }
 
-    // Generate QR as data URL
+    const paymentLink = `https://payments.cashfree.com/pg/links/${cfData.payment_session_id}`;
+
     const qrDataUrl = await QRCode.toDataURL(paymentLink);
 
-    // persist order (simple JSON file for demo)
-    const ordersPath = path.join(__dirname, '..', 'data', 'orders.json');
+    const ordersPath = path.join(__dirname, "..", "data", "orders.json");
     let orders = [];
-    try { orders = JSON.parse(fs.readFileSync(ordersPath)); } catch (e) {}
-    orders.push({ orderId, user_id, amount, paymentLink, status: 'CREATED', createdAt: new Date().toISOString() });
+    try {
+      orders = JSON.parse(fs.readFileSync(ordersPath));
+    } catch (e) {}
+
+    orders.push({
+      orderId,
+      user_id,
+      amount,
+      paymentLink,
+      createdAt: new Date().toISOString(),
+      status: "CREATED"
+    });
+
     fs.writeFileSync(ordersPath, JSON.stringify(orders, null, 2));
 
-    // Optionally notify user via Telegram (if bot token present)
-    const botToken = process.env.TELEGRAM_BOT_TOKEN;
-    if (botToken) {
-      try {
-        await sendMessage(botToken, user_id, `Payment link তৈরি হয়েছে — ₹${amount}\n${paymentLink}`);
-      } catch (e) { console.error('telegram send failed', e.message); }
-    }
+    return res.json({
+      orderId,
+      paymentLink,
+      qrDataUrl
+    });
 
-    return res.json({ orderId, paymentLink, qrDataUrl });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
+    console.error("Create Order Error:", err.message);
+    return res.status(500).json({
+      error: "Cashfree Order Failed",
+      detail: err.message
+    });
   }
 };
